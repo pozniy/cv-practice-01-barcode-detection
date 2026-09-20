@@ -18,12 +18,9 @@ class DetectorConfig:
     working_width: int = 1000
     blackhat_kernel: tuple[int, int] = (15, 5)
     blur_kernel: tuple[int, int] = (9, 9)
-    morphology_variants: tuple[tuple[int, int, int, int], ...] = (
-        (21, 5, 0, 0),
-        (21, 5, 1, 1),
-        (21, 5, 2, 4),
-        (31, 7, 2, 4),
-    )
+    morphology_kernel: tuple[int, int] = (21, 5)
+    erode_iterations: int = 2
+    dilate_iterations: int = 4
 
     min_area_fraction: float = 0.003
     max_area_fraction: float = 0.40
@@ -31,16 +28,9 @@ class DetectorConfig:
     max_aspect_ratio: float = 8.0
     min_width: int = 40
     min_height: int = 15
-    duplicate_iou: float = 0.90
 
 
 DEFAULT_CONFIG = DetectorConfig()
-
-
-SCORE_WEIGHTS = np.asarray(
-    [0.15, 0.02, 0.01, 0.02, 0.10, 0.45, 0.12, 0.06, 0.05, 0.02],
-    dtype=np.float32,
-)
 
 
 def box_iou(box_a: Iterable[float], box_b: Iterable[float]) -> float:
@@ -98,7 +88,7 @@ def build_feature_maps(
     gray_gradient_x = np.abs(cv2.Scharr(gray, cv2.CV_32F, 1, 0))
     gray_gradient_y = np.abs(cv2.Scharr(gray, cv2.CV_32F, 0, 1))
 
-    morphology_masks = _make_morphology_masks(binary, config.morphology_variants)
+    morphology_mask = _make_morphology_mask(binary, config)
 
     return {
         "working": working,
@@ -110,58 +100,18 @@ def build_feature_maps(
         "binary": binary,
         "gradient_x": gray_gradient_x,
         "gradient_y": gray_gradient_y,
-        "morphology_masks": morphology_masks,
+        "morphology_mask": morphology_mask,
     }
 
 
-def _log_gaussian(value: float, preferred: float, spread: float) -> float:
-    value = max(float(value), 1e-6)
-    return float(np.exp(-(np.log(value / preferred) / spread) ** 2))
-
-
-def _candidate_features(
-    contour: np.ndarray,
-    box: BBox,
-    maps: dict[str, Any],
-) -> np.ndarray:
+def _candidate_score(box: BBox, maps: dict[str, Any]) -> float:
     x, y, width, height = box
-    image_height, image_width = maps["gray"].shape
-    area_fraction = width * height / (image_width * image_height)
-    aspect_ratio = width / max(height, 1)
-
     roi_x = maps["gradient_x"][y : y + height, x : x + width]
     roi_y = maps["gradient_y"][y : y + height, x : x + width]
-    roi_feature = maps["gradient"][y : y + height, x : x + width]
 
     mean_x = float(roi_x.mean())
     mean_y = float(roi_y.mean())
-    directional_ratio = mean_x / (mean_x + mean_y + 1e-6)
-
-    column_profile = roi_x.mean(axis=0)
-    row_profile = roi_x.mean(axis=1)
-    column_cv = float(column_profile.std() / (column_profile.mean() + 1e-6))
-    row_cv = float(row_profile.std() / (row_profile.mean() + 1e-6))
-
-    strong_threshold = float(np.quantile(roi_x, 0.80))
-    column_occupancy = (roi_x > strong_threshold).mean(axis=0)
-    coherent_columns = float((column_occupancy > 0.18).mean())
-    extent = float(cv2.contourArea(contour) / (width * height))
-
-    return np.asarray(
-        [
-            _log_gaussian(aspect_ratio, 2.0, 0.75),
-            _log_gaussian(area_fraction, 0.065, 1.0),
-            _log_gaussian(width / image_width, 0.42, 0.70),
-            _log_gaussian(height / image_height, 0.155, 0.80),
-            extent,
-            directional_ratio,
-            np.tanh(column_cv / 2.0),
-            np.tanh((column_cv / (row_cv + 1e-6)) / 3.0),
-            coherent_columns,
-            float(roi_feature.mean() / 255.0),
-        ],
-        dtype=np.float32,
-    )
+    return mean_x / (mean_x + mean_y + 1e-6)
 
 
 def _working_to_original_box(box: BBox, scale: float, shape: tuple[int, ...]) -> BBox:
@@ -174,22 +124,13 @@ def _working_to_original_box(box: BBox, scale: float, shape: tuple[int, ...]) ->
     return x1, y1, x2 - x1, y2 - y1
 
 
-def _make_morphology_masks(
-    binary: np.ndarray,
-    variants: Iterable[tuple[int, int, int, int]],
-) -> list[np.ndarray]:
-    masks: list[np.ndarray] = []
-    for kernel_width, kernel_height, erode_iterations, dilate_iterations in variants:
-        element = cv2.getStructuringElement(
-            cv2.MORPH_RECT, (kernel_width, kernel_height)
-        )
-        mask = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, element)
-        if erode_iterations:
-            mask = cv2.erode(mask, None, iterations=erode_iterations)
-        if dilate_iterations:
-            mask = cv2.dilate(mask, None, iterations=dilate_iterations)
-        masks.append(mask)
-    return masks
+def _make_morphology_mask(
+    binary: np.ndarray, config: DetectorConfig
+) -> np.ndarray:
+    element = cv2.getStructuringElement(cv2.MORPH_RECT, config.morphology_kernel)
+    mask = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, element)
+    mask = cv2.erode(mask, None, iterations=config.erode_iterations)
+    return cv2.dilate(mask, None, iterations=config.dilate_iterations)
 
 
 def detect_barcode(
@@ -201,40 +142,28 @@ def detect_barcode(
     image_height, image_width = maps["gray"].shape
     candidates: list[dict[str, Any]] = []
 
-    for variant_index, mask in enumerate(maps["morphology_masks"]):
-        contours, _ = cv2.findContours(
-            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    mask = maps["morphology_mask"]
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for contour in contours:
+        x, y, width, height = cv2.boundingRect(contour)
+        box = (x, y, width, height)
+        area_fraction = width * height / (image_width * image_height)
+        aspect_ratio = width / max(height, 1)
+
+        if not (
+            config.min_area_fraction <= area_fraction <= config.max_area_fraction
+            and config.min_aspect_ratio <= aspect_ratio <= config.max_aspect_ratio
+            and width >= config.min_width
+            and height >= config.min_height
+        ):
+            continue
+
+        candidates.append(
+            {
+                "box": _working_to_original_box(box, maps["scale"], image.shape),
+                "score": _candidate_score(box, maps),
+            }
         )
-        for contour in contours:
-            x, y, width, height = cv2.boundingRect(contour)
-            box = (x, y, width, height)
-            area_fraction = width * height / (image_width * image_height)
-            aspect_ratio = width / max(height, 1)
-
-            if not (
-                config.min_area_fraction <= area_fraction <= config.max_area_fraction
-                and config.min_aspect_ratio <= aspect_ratio <= config.max_aspect_ratio
-                and width >= config.min_width
-                and height >= config.min_height
-            ):
-                continue
-
-            if any(
-                box_iou(box, candidate["working_box"]) > config.duplicate_iou
-                for candidate in candidates
-            ):
-                continue
-
-            features = _candidate_features(contour, box, maps)
-            candidates.append(
-                {
-                    "working_box": box,
-                    "box": _working_to_original_box(box, maps["scale"], image.shape),
-                    "score": float(features @ SCORE_WEIGHTS),
-                    "features": features,
-                    "variant_index": variant_index,
-                }
-            )
 
     candidates.sort(key=lambda candidate: candidate["score"], reverse=True)
     prediction = candidates[0]["box"] if candidates else None
@@ -244,11 +173,6 @@ def detect_barcode(
 
     debug = dict(maps)
     debug["candidates"] = candidates
-    debug["selected_mask"] = (
-        maps["morphology_masks"][candidates[0]["variant_index"]]
-        if candidates
-        else maps["morphology_masks"][0]
-    )
     return prediction, debug
 
 

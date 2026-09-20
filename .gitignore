@@ -1,0 +1,8 @@
+.venv/
+.idea/
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Generated detector artifacts
+outputs/
